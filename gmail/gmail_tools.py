@@ -8,6 +8,7 @@ import logging
 import asyncio
 import base64
 import binascii
+import io
 import re
 import ssl
 import mimetypes
@@ -25,8 +26,9 @@ from mcp.types import ToolAnnotations
 
 from pydantic import Field
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
-from auth.service_decorator import require_google_service
+from auth.service_decorator import require_google_service, require_multiple_services
 from core.attachment_storage import get_attachment_storage, STORAGE_DIR
 from core.config import (
     WORKSPACE_EXTERNAL_URL,
@@ -1444,7 +1446,8 @@ async def get_gmail_message_content(
             content_lines.append(
                 f"{i}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
                 f"   Attachment ID: {att['attachmentId']}\n"
-                f"   Use get_gmail_attachment_content(message_id='{message_id}', attachment_id='{att['attachmentId']}') to download"
+                f"   Use get_gmail_attachment_content(message_id='{message_id}', attachment_id='{att['attachmentId']}') to download,\n"
+                f"   or save_gmail_attachment_to_drive(message_id='{message_id}', attachment_id='{att['attachmentId']}', folder_id=...) to save it straight to Drive"
             )
 
     return "\n".join(content_lines)
@@ -1626,7 +1629,8 @@ async def get_gmail_messages_content_batch(
                             msg_output += (
                                 f"{i}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
                                 f"   Attachment ID: {att['attachmentId']}\n"
-                                f"   Use get_gmail_attachment_content(message_id='{mid}', attachment_id='{att['attachmentId']}') to download\n"
+                                f"   Use get_gmail_attachment_content(message_id='{mid}', attachment_id='{att['attachmentId']}') to download,\n"
+                                f"   or save_gmail_attachment_to_drive(message_id='{mid}', attachment_id='{att['attachmentId']}', folder_id=...) to save it straight to Drive\n"
                             )
 
                     output_messages.append(msg_output)
@@ -1636,6 +1640,70 @@ async def get_gmail_messages_content_batch(
     final_output += "\n---\n\n".join(output_messages)
 
     return final_output
+
+
+async def _resolve_attachment_filename_and_mime(
+    service,
+    message_id: str,
+    attachment_id: str,
+    size_bytes: int,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve an attachment's filename and MIME type by re-fetching message metadata.
+
+    Attachment IDs are ephemeral, so after an exact-ID match this falls back to
+    matching by size, then to the sole attachment if the message has only one.
+    Returns (None, None) if resolution fails.
+    """
+    filename = None
+    mime_type = None
+    try:
+        # Use format="full" with fields to limit response to attachment metadata only
+        message_full = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="full",
+                fields="payload(parts(filename,mimeType,body(attachmentId,size)),body(attachmentId,size),filename,mimeType)",
+            )
+            .execute
+        )
+        payload = message_full.get("payload", {})
+        attachments = _extract_attachments(payload)
+
+        # First try exact attachmentId match
+        for att in attachments:
+            if att.get("attachmentId") == attachment_id:
+                filename = att.get("filename")
+                mime_type = att.get("mimeType")
+                break
+
+        # Fallback: match by size if exactly one attachment matches (IDs are ephemeral)
+        if not filename and attachments:
+            size_matches = [
+                att
+                for att in attachments
+                if att.get("size") and abs(att["size"] - size_bytes) < 100
+            ]
+            if len(size_matches) == 1:
+                filename = size_matches[0].get("filename")
+                mime_type = size_matches[0].get("mimeType")
+                logger.warning(
+                    f"Attachment {attachment_id} matched by size fallback as '{filename}'"
+                )
+
+        # Last resort: if only one attachment, use its name
+        if not filename and len(attachments) == 1:
+            filename = attachments[0].get("filename")
+            mime_type = attachments[0].get("mimeType")
+    except Exception:
+        logger.debug(
+            f"Could not fetch attachment metadata for {attachment_id}, using defaults"
+        )
+
+    return filename, mime_type
 
 
 @server.tool(
@@ -1664,6 +1732,10 @@ async def get_gmail_attachment_content(
     In stdio mode, returns the local file path for direct access.
     In HTTP mode, returns a temporary download URL (valid for 1 hour).
     May re-fetch message metadata to resolve filename and MIME type.
+
+    If the goal is to store the attachment in Google Drive, use
+    save_gmail_attachment_to_drive instead — it transfers the file
+    server-side in a single call without relaying its content.
 
     Args:
         message_id (str): The ID of the Gmail message containing the attachment.
@@ -1740,54 +1812,9 @@ async def get_gmail_attachment_content(
 
         storage = get_attachment_storage()
 
-        # Try to get filename and mime type from message
-        filename = None
-        mime_type = None
-        try:
-            # Use format="full" with fields to limit response to attachment metadata only
-            message_full = await asyncio.to_thread(
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
-                    fields="payload(parts(filename,mimeType,body(attachmentId,size)),body(attachmentId,size),filename,mimeType)",
-                )
-                .execute
-            )
-            payload = message_full.get("payload", {})
-            attachments = _extract_attachments(payload)
-
-            # First try exact attachmentId match
-            for att in attachments:
-                if att.get("attachmentId") == attachment_id:
-                    filename = att.get("filename")
-                    mime_type = att.get("mimeType")
-                    break
-
-            # Fallback: match by size if exactly one attachment matches (IDs are ephemeral)
-            if not filename and attachments:
-                size_matches = [
-                    att
-                    for att in attachments
-                    if att.get("size") and abs(att["size"] - size_bytes) < 100
-                ]
-                if len(size_matches) == 1:
-                    filename = size_matches[0].get("filename")
-                    mime_type = size_matches[0].get("mimeType")
-                    logger.warning(
-                        f"Attachment {attachment_id} matched by size fallback as '{filename}'"
-                    )
-
-            # Last resort: if only one attachment, use its name
-            if not filename and len(attachments) == 1:
-                filename = attachments[0].get("filename")
-                mime_type = attachments[0].get("mimeType")
-        except Exception:
-            logger.debug(
-                f"Could not fetch attachment metadata for {attachment_id}, using defaults"
-            )
+        filename, mime_type = await _resolve_attachment_filename_and_mime(
+            service, message_id, attachment_id, size_bytes
+        )
 
         # Save attachment to local disk
         result = storage.save_attachment(
@@ -1842,6 +1869,135 @@ async def get_gmail_attachment_content(
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
         return "\n".join(result_lines)
+
+
+@server.tool(
+    title="Save Gmail Attachment to Drive",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("save_gmail_attachment_to_drive", service_type="gmail")
+@require_multiple_services(
+    [
+        {
+            "service_type": "gmail",
+            "scopes": "gmail_read",
+            "param_name": "gmail_service",
+        },
+        {
+            "service_type": "drive",
+            "scopes": "drive_file",
+            "param_name": "drive_service",
+        },
+    ]
+)
+async def save_gmail_attachment_to_drive(
+    gmail_service: Any,
+    drive_service: Any,
+    user_google_email: str,
+    message_id: str,
+    attachment_id: str,
+    folder_id: str = "root",
+    file_name: Optional[str] = None,
+) -> str:
+    """
+    Saves a Gmail attachment directly to Google Drive, entirely server-side.
+
+    The attachment bytes are streamed from Gmail to Drive without ever being
+    returned in the tool response, so this works reliably for attachments of
+    any size — including small ones — and in stateless deployments with no
+    local disk. Prefer this over get_gmail_attachment_content whenever the
+    destination is Google Drive.
+
+    Args:
+        message_id (str): The ID of the Gmail message containing the attachment.
+        attachment_id (str): The ID of the attachment to save.
+        user_google_email (str): The user's Google email address. Required.
+        folder_id (str): Destination Drive folder ID. Defaults to "root"
+            (My Drive). Shared drive folders are supported.
+        file_name (Optional[str]): Name for the created Drive file. Defaults to
+            the attachment's original filename when it can be resolved.
+
+    Returns:
+        str: Confirmation with the created Drive file's ID and web link.
+    """
+    logger.info(
+        f"[save_gmail_attachment_to_drive] Invoked. Message ID: '{message_id}', "
+        f"Folder: '{folder_id}', Email: '{user_google_email}'"
+    )
+
+    try:
+        attachment = await asyncio.to_thread(
+            gmail_service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute
+        )
+    except Exception as e:
+        logger.error(
+            f"[save_gmail_attachment_to_drive] Failed to download attachment: {e}"
+        )
+        return (
+            f"Error: Failed to download attachment. The attachment ID may have changed.\n"
+            f"Please fetch the message content again to get an updated attachment ID.\n\n"
+            f"Error details: {str(e)}"
+        )
+
+    size_bytes = attachment.get("size", 0)
+    base64_data = attachment.get("data", "")
+
+    try:
+        file_bytes = base64.urlsafe_b64decode(base64_data)
+    except (binascii.Error, ValueError) as e:
+        logger.error(
+            f"[save_gmail_attachment_to_drive] Failed to decode attachment data: {e}"
+        )
+        return f"Error: Failed to decode attachment data: {e}"
+
+    resolved_name, resolved_mime = await _resolve_attachment_filename_and_mime(
+        gmail_service, message_id, attachment_id, size_bytes
+    )
+
+    final_name = file_name or resolved_name
+    if not final_name:
+        final_name = f"gmail-attachment-{attachment_id[:16]}"
+    mime_type = resolved_mime or (
+        mimetypes.guess_type(final_name)[0] or "application/octet-stream"
+    )
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(file_bytes), mimetype=mime_type, resumable=True
+    )
+    created_file = await asyncio.to_thread(
+        drive_service.files()
+        .create(
+            body={"name": final_name, "parents": [folder_id]},
+            media_body=media,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    size_kb = len(file_bytes) / 1024
+    link = created_file.get("webViewLink", "No link available")
+    logger.info(
+        f"[save_gmail_attachment_to_drive] Saved {size_kb:.1f} KB attachment as "
+        f"Drive file {created_file.get('id')} in folder '{folder_id}'"
+    )
+    return (
+        f"Attachment saved to Google Drive!\n"
+        f"File: {created_file.get('name', final_name)} ({size_kb:.1f} KB)\n"
+        f"Drive File ID: {created_file.get('id', 'N/A')}\n"
+        f"Folder ID: {folder_id}\n"
+        f"Link: {link}\n\n"
+        f"Note: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
+    )
 
 
 @server.tool(
@@ -2468,7 +2624,8 @@ def _format_thread_content(
                 content_lines.append(
                     f"{j}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
                     f"   Attachment ID: {att['attachmentId']}\n"
-                    f"   Use get_gmail_attachment_content(message_id='{message_id}', attachment_id='{att['attachmentId']}') to download"
+                    f"   Use get_gmail_attachment_content(message_id='{message_id}', attachment_id='{att['attachmentId']}') to download,\n"
+                    f"   or save_gmail_attachment_to_drive(message_id='{message_id}', attachment_id='{att['attachmentId']}', folder_id=...) to save it straight to Drive"
                 )
             content_lines.append("")
 

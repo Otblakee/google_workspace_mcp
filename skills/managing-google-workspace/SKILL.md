@@ -76,6 +76,7 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 | Send email (new or reply) | `send_gmail_message` |
 | Create draft | `draft_gmail_message` |
 | Download attachment | `get_gmail_attachment_content` |
+| Save attachment to Drive | `save_gmail_attachment_to_drive` |
 | Add/remove labels (one) | `modify_gmail_message_labels` |
 | Add/remove labels (batch) | `batch_modify_gmail_message_labels` |
 | Manage labels | `manage_gmail_label` |
@@ -290,7 +291,8 @@ Parameters: `user_google_email` (string, optional), `service_name` (string, requ
 ### Process email attachments
 1. `search_gmail_messages` -- find the email
 2. `get_gmail_message_content` -- get attachment metadata
-3. `get_gmail_attachment_content` -- download the attachment
+3. `get_gmail_attachment_content` -- download the attachment, or
+   `save_gmail_attachment_to_drive` -- save it straight to a Drive folder (server-side, any size)
 
 ### Edit a Google Doc
 1. `get_doc_as_markdown` -- read current content
