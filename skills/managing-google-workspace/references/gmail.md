@@ -3,7 +3,7 @@
 MCP tools for Gmail message search, sending, drafting, labels, and filters. All tools require `user_google_email` (string, required).
 
 ## Contents
-- Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content
+- Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content, save_gmail_attachment_to_drive
 - Send & Draft: send_gmail_message, draft_gmail_message
 - Label Management: list_gmail_labels, manage_gmail_label, modify_gmail_message_labels, batch_modify_gmail_message_labels
 - Filter Management: list_gmail_filters, manage_gmail_filter
@@ -64,6 +64,17 @@ Download an attachment to local disk (stdio mode) or get a temporary URL (HTTP m
 | message_id | string | yes | | |
 | attachment_id | string | yes | | |
 | user_google_email | string | yes | | |
+
+### save_gmail_attachment_to_drive
+Save an attachment directly to Google Drive in a single server-side call. The file content never passes through the conversation, so this works for attachments of any size. Prefer this whenever the destination is Drive.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| message_id | string | yes | | |
+| attachment_id | string | yes | | |
+| user_google_email | string | yes | | |
+| folder_id | string | no | root | Destination Drive folder ID; shared drives supported |
+| file_name | string | no | | Defaults to the attachment's original filename |
 
 ---
 
@@ -221,4 +232,5 @@ Create or delete a filter.
 ### Attachments
 - To find attachments, read the message with `get_gmail_message_content` -- attachment IDs are listed in the response.
 - Download with `get_gmail_attachment_content` using both the message_id and attachment_id.
+- To store an attachment in Google Drive, use `save_gmail_attachment_to_drive` -- it transfers the file server-side without relaying its content, so no size limits or re-encoding apply.
 - When sending/drafting, attachments can be specified as file paths (auto-encoded) or pre-encoded base64 content (standard base64, not urlsafe).
