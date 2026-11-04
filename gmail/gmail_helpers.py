@@ -13,7 +13,9 @@ from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 
-RAW_BODY_TRUNCATE_LIMIT = 20000
+# Cap (in bytes) for body_format='raw' and the html body returned by
+# body_format='html'. Larger content is truncated and the full size reported.
+RAW_BODY_TRUNCATE_LIMIT = 1024 * 1024
 GMAIL_QUOTA_ERROR_MARKERS = (
     "dailyLimitExceeded",
     "quotaExceeded",
